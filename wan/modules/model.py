@@ -186,7 +186,91 @@ class WanT2VCrossAttention(WanSelfAttention):
             v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        if crossattn_cache is not None and \
+                crossattn_cache.get("fg_boost_factor", 1.0) != 1.0 and \
+                crossattn_cache.get("fg_indices", None) is not None and \
+                crossattn_cache.get("apply_enhance", False):
+            q_src, q_trg = q.chunk(2, dim=0)
+            k_src, k_trg = k.chunk(2, dim=0)
+            v_src, v_trg = v.chunk(2, dim=0)
+
+            fg_boost_factor = crossattn_cache["fg_boost_factor"]
+            if not isinstance(crossattn_cache["fg_indices"][0], list):
+                fg_indices = [crossattn_cache["fg_indices"]] * v_trg.shape[0]
+            else:
+                fg_indices = crossattn_cache["fg_indices"][v_src.shape[0]:]
+
+            w_trg = torch.ones_like(v_trg)
+            for i, inds in enumerate(fg_indices):
+                if len(inds) > 0:
+                    w_trg[i, inds, :, :] = fg_boost_factor
+
+            if crossattn_cache.get("current_src_fg_mask", None) is not None:
+                fg_mask = crossattn_cache["current_src_fg_mask"]
+                bg_mask = ~fg_mask
+                x_trg_list = []
+                for b_idx in range(q_trg.shape[0]):
+                    b_x_trg = torch.zeros_like(q_trg[b_idx]).unsqueeze(0)
+                    if bg_mask[b_idx].any():
+                        b_x_trg_bg = flash_attention(
+                            q_trg[b_idx, bg_mask[b_idx]].unsqueeze(0),
+                            k_trg[b_idx].unsqueeze(0),
+                            v_trg[b_idx].unsqueeze(0),
+                            k_lens=context_lens
+                        )
+                        b_x_trg[:, bg_mask[b_idx]] = b_x_trg_bg
+                    if fg_mask[b_idx].any():
+                        b_x_trg_fg_packed = flash_attention(
+                            q_trg[b_idx, fg_mask[b_idx]].unsqueeze(0).repeat_interleave(2, dim=0),
+                            k_trg[b_idx].unsqueeze(0).repeat_interleave(2, dim=0),
+                            torch.cat([
+                                v_trg[b_idx].unsqueeze(0) * w_trg[b_idx].unsqueeze(0),
+                                w_trg[b_idx].unsqueeze(0)
+                            ], dim=0),
+                            k_lens=context_lens
+                        )
+                        b_x_trg_fg_num, b_x_trg_fg_denom = b_x_trg_fg_packed.chunk(2, dim=0)
+                        b_x_trg[:, fg_mask[b_idx]] = b_x_trg_fg_num / b_x_trg_fg_denom
+                    x_trg_list.append(b_x_trg)
+                x_trg = torch.cat(x_trg_list, dim=0)
+            else:
+                x_trg_packed = flash_attention(
+                    q_trg.repeat_interleave(2, dim=0),
+                    k_trg.repeat_interleave(2, dim=0),
+                    torch.cat([v_trg * w_trg, w_trg], dim=0),
+                    k_lens=context_lens
+                )
+                x_trg_num, x_trg_denom = x_trg_packed.chunk(2, dim=0)
+                x_trg = x_trg_num / x_trg_denom
+
+            x_src = flash_attention(q_src, k_src, v_src, k_lens=context_lens)
+            crossattn_cache["apply_enhance"] = False
+            x = torch.cat([x_src, x_trg], dim=0)
+        else:
+            x = flash_attention(q, k, v, k_lens=context_lens)
+
+        if crossattn_cache is not None and \
+                crossattn_cache.get("fg_indices", None) is not None and \
+                crossattn_cache.get("obtain_mask", False):
+            if not isinstance(crossattn_cache["fg_indices"][0], list):
+                fg_indices = [crossattn_cache["fg_indices"]]
+            else:
+                fg_indices = crossattn_cache["fg_indices"]
+
+            mask_value_list = []
+            for fg_idx in fg_indices:
+                mask_value = torch.zeros_like(v[:1])
+                if len(fg_idx):
+                    mask_value += -1 / (v.size(1) - len(fg_idx))
+                    mask_value[:, fg_idx] = crossattn_cache.get("fg_scale", 1) / len(fg_idx)
+                mask_value_list.append(mask_value)
+            if len(mask_value_list) == 1:
+                mask_value_list = mask_value_list * b
+
+            mask_value = torch.cat(mask_value_list, dim=0)
+            mask_soft = flash_attention(q, k, mask_value, k_lens=context_lens).mean(dim=[2, 3], keepdim=True)
+            crossattn_cache["obtain_mask"] = False
+            crossattn_cache["fg_mask_soft"] = mask_soft
 
         # output
         x = x.flatten(2)

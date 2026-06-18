@@ -372,6 +372,7 @@ class CausalWanSelfAttention(nn.Module):
                 cache_update_info = {
                     "action": "roll_and_insert",
                     "sink_tokens": sink_tokens,
+                    "num_new_tokens": num_new_tokens,
                     "num_rolled_tokens": num_rolled_tokens,
                     "num_evicted_tokens": num_evicted_tokens,
                     "local_start_index": local_start_index,
@@ -417,6 +418,8 @@ class CausalWanSelfAttention(nn.Module):
                 # Save cache update info for later use
                 cache_update_info = {
                     "action": "direct_insert",
+                    "sink_tokens": sink_tokens,
+                    "num_new_tokens": num_new_tokens,
                     "local_start_index": local_start_index,
                     "local_start_index_bank": local_start_index_bank,
                     "local_end_index": local_end_index,
@@ -479,11 +482,169 @@ class CausalWanSelfAttention(nn.Module):
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
-                x = attention(
-                    roped_query,
-                    k_cat,
-                    v_cat
-                )
+                if kv_cache.get("trg_fg_mask", None) is None or kv_cache.get("current_src_fg_mask", None) is None:
+                    x = attention(
+                        roped_query,
+                        k_cat,
+                        v_cat
+                    )
+                else:
+                    src_query, trg_query = roped_query.chunk(2, dim=0)
+                    src_sink_key, trg_sink_key = k_sink.chunk(2, dim=0)
+                    src_sink_value, trg_sink_value = v_sink.chunk(2, dim=0)
+                    src_bank_key, trg_bank_key = k_bank.chunk(2, dim=0)
+                    src_bank_value, trg_bank_value = v_bank.chunk(2, dim=0)
+                    if kv_cache["shared_dict"].get("debug_disable_bank_in_dual", False):
+                        src_bank_key = src_bank_key[:, :0]
+                        trg_bank_key = trg_bank_key[:, :0]
+                        src_bank_value = src_bank_value[:, :0]
+                        trg_bank_value = trg_bank_value[:, :0]
+                    src_local_key, trg_local_key = k_local.chunk(2, dim=0)
+                    src_local_value, trg_local_value = v_local.chunk(2, dim=0)
+                    blender_rate = 1 - kv_cache['shared_dict']['current_timestep'] ** kv_cache['shared_dict']['blend_power']
+                    bridge_mode = kv_cache['shared_dict'].get('bridge_mode', 'normal')
+                    bridge_fg_target_floor = kv_cache['shared_dict'].get('bridge_fg_target_floor', 0.65)
+
+                    src_context_key = torch.cat([src_sink_key, src_bank_key, src_local_key], dim=1)
+                    src_context_value = torch.cat([src_sink_value, src_bank_value, src_local_value], dim=1)
+                    trg_context_key = torch.cat([trg_sink_key, trg_bank_key, trg_local_key], dim=1)
+                    trg_context_value = torch.cat([trg_sink_value, trg_bank_value, trg_local_value], dim=1)
+
+                    current_start_pos = local_start_index
+                    current_end_pos = local_end_index
+                    layout_masks = []
+                    if src_sink_key.shape[1] > 0:
+                        sink_positions = torch.arange(
+                            0, sink_tokens, device=roped_query.device
+                        )
+                        layout_masks.append(
+                            (sink_positions >= current_start_pos)
+                            & (sink_positions < current_end_pos)
+                        )
+                    if src_bank_key.shape[1] > 0:
+                        layout_masks.append(
+                            torch.zeros([src_bank_key.shape[1]], dtype=torch.bool, device=roped_query.device)
+                        )
+                    if src_local_key.shape[1] > 0:
+                        local_positions = torch.arange(
+                            local_start_for_window, local_end_index, device=roped_query.device
+                        )
+                        layout_masks.append(
+                            (local_positions >= current_start_pos)
+                            & (local_positions < current_end_pos)
+                        )
+                    if layout_masks:
+                        context_current_mask = torch.cat(layout_masks, dim=0)
+                    else:
+                        context_current_mask = torch.zeros(
+                            [0], dtype=torch.bool, device=roped_query.device
+                        )
+                    if (
+                        context_current_mask.sum().item() != num_new_tokens
+                        and context_current_mask.shape[0] >= num_new_tokens
+                    ):
+                        # Fallback for unusual cache layouts: preserve the old
+                        # streaming assumption while making the mismatch visible
+                        # in debugging through the selected length.
+                        context_current_mask = torch.zeros_like(context_current_mask)
+                        context_current_mask[-num_new_tokens:] = True
+                    context_prev_mask = ~context_current_mask
+
+                    src_prev_key = src_context_key[:, context_prev_mask]
+                    src_prev_value = src_context_value[:, context_prev_mask]
+                    src_current_key = src_context_key[:, context_current_mask]
+                    src_current_value = src_context_value[:, context_current_mask]
+                    trg_prev_key = trg_context_key[:, context_prev_mask]
+                    trg_prev_value = trg_context_value[:, context_prev_mask]
+                    trg_current_key = trg_context_key[:, context_current_mask]
+                    trg_current_value = trg_context_value[:, context_current_mask]
+
+                    src_key = torch.cat([src_sink_key, src_bank_key, src_local_key], dim=1)
+                    src_value = torch.cat([src_sink_value, src_bank_value, src_local_value], dim=1)
+                    x_list = [attention(src_query, src_key, src_value)]
+
+                    mask_parts = []
+                    if trg_sink_key.shape[1] > 0:
+                        mask_parts.append(kv_cache["trg_fg_mask"][:, :sink_tokens])
+                    if trg_bank_key.shape[1] > 0:
+                        bank_fg_mask = kv_bank.get("fg_mask", None)
+                        if bank_fg_mask is not None:
+                            _, trg_bank_fg_mask = bank_fg_mask[:, :trg_bank_key.shape[1]].chunk(2, dim=0)
+                        else:
+                            trg_bank_fg_mask = torch.zeros(
+                                [trg_bank_key.shape[0], trg_bank_key.shape[1]],
+                                dtype=torch.bool,
+                                device=trg_bank_key.device,
+                            )
+                        mask_parts.append(trg_bank_fg_mask)
+                    if trg_local_key.shape[1] > 0:
+                        mask_parts.append(kv_cache["trg_fg_mask"][:, local_start_for_window:local_end_index])
+                    if mask_parts:
+                        trg_context_fg_mask = torch.cat(mask_parts, dim=1)
+                    else:
+                        trg_context_fg_mask = kv_cache["trg_fg_mask"][:, :0]
+                    trg_prev_fg_mask = trg_context_fg_mask[:, context_prev_mask]
+
+                    for b_idx in range(b // 2):
+                        b_key_list = []
+                        b_value_list = []
+
+                        if trg_prev_key.shape[1] > 0:
+                            b_trg_prev_key = trg_prev_key[b_idx].clone()
+                            b_trg_prev_fg_mask = trg_prev_fg_mask[b_idx]
+                            if b_trg_prev_fg_mask.any():
+                                if bridge_mode == "soft_fg_target":
+                                    fg_rate = max(blender_rate, bridge_fg_target_floor)
+                                    b_trg_prev_key[b_trg_prev_fg_mask] = (
+                                        b_trg_prev_key[b_trg_prev_fg_mask] * fg_rate
+                                        + src_prev_key[b_idx, b_trg_prev_fg_mask] * (1 - fg_rate)
+                                    )
+                                else:
+                                    b_trg_prev_key[b_trg_prev_fg_mask] = (
+                                        b_trg_prev_key[b_trg_prev_fg_mask] * blender_rate
+                                        + src_prev_key[b_idx, b_trg_prev_fg_mask] * (1 - blender_rate)
+                                    )
+                            b_key_list.append(b_trg_prev_key)
+                            b_value_list.append(trg_prev_value[b_idx])
+
+                        b_src_current_fg_mask = kv_cache["current_src_fg_mask"][b_idx]
+                        b_src_current_bg_mask = ~b_src_current_fg_mask
+                        can_blend_current = (
+                            src_current_key.shape[1] == trg_current_key.shape[1]
+                            and src_current_key.shape[1] == b_src_current_fg_mask.shape[0]
+                        )
+                        if (
+                            can_blend_current
+                            and kv_cache['shared_dict']['current_timestep_index'] > kv_cache['shared_dict']['total_timestep'] // 2
+                        ):
+                            if b_src_current_bg_mask.any():
+                                b_key_list.append(src_current_key[b_idx][b_src_current_bg_mask])
+                                b_value_list.append(src_current_value[b_idx][b_src_current_bg_mask])
+
+                        if can_blend_current:
+                            b_trg_current_key = trg_current_key[b_idx] * blender_rate + src_current_key[b_idx] * (1 - blender_rate)
+                            b_query = trg_query[b_idx] * blender_rate + src_query[b_idx] * (1 - blender_rate)
+                            if bridge_mode == "soft_fg_target" and b_src_current_fg_mask.any():
+                                fg_rate = max(blender_rate, bridge_fg_target_floor)
+                                b_trg_current_key[b_src_current_fg_mask] = (
+                                    trg_current_key[b_idx][b_src_current_fg_mask] * fg_rate
+                                    + src_current_key[b_idx][b_src_current_fg_mask] * (1 - fg_rate)
+                                )
+                                b_query[b_src_current_fg_mask] = (
+                                    trg_query[b_idx][b_src_current_fg_mask] * fg_rate
+                                    + src_query[b_idx][b_src_current_fg_mask] * (1 - fg_rate)
+                                )
+                        else:
+                            b_trg_current_key = trg_current_key[b_idx]
+                            b_query = trg_query[b_idx]
+                        b_trg_current_value = trg_current_value[b_idx]
+                        b_key_list.append(b_trg_current_key)
+                        b_value_list.append(b_trg_current_value)
+
+                        b_trg_key = torch.cat(b_key_list, dim=0)
+                        b_trg_value = torch.cat(b_value_list, dim=0)
+                        x_list.append(attention(b_query.unsqueeze(0), b_trg_key.unsqueeze(0), b_trg_value.unsqueeze(0)))
+                    x = torch.cat(x_list, dim=0)
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
                 x = attention(
@@ -1002,6 +1163,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             if update_info is not None:
                 cache = kv_cache[block_index]
                 bank = kv_bank[block_index]
+                cache["update_info"] = {
+                    k: v for k, v in update_info.items()
+                    if k not in ["new_k", "new_v"]
+                }
                 
                 if update_info["action"] == "roll_and_insert":
                     # Apply rolling update
@@ -1019,6 +1184,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     current_end_bank = update_info["current_end_bank"]
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
+                    new_fg_mask = bank.get("fg_mask_new", None)
                     
                     # Perform the rolling operation
                     cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
@@ -1033,6 +1199,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         if update_bank:
                             bank["k_new"][:,:] = new_k[:, :1560]
                             bank["v_new"][:,:] = new_v[:, :1560]
+                            if new_fg_mask is not None:
+                                bank["fg_mask_new"][:,:] = new_fg_mask
                     
                 elif update_info["action"] == "direct_insert":
                     # Direct insert
@@ -1047,6 +1215,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     current_end_bank = update_info["current_end_bank"]
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
+                    new_fg_mask = bank.get("fg_mask_new", None)
                     
                     # Insert new key/value
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
@@ -1055,6 +1224,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         if update_bank:
                             bank["k_new"][:,:] = new_k[:, :1560]
                             bank["v_new"][:,:] = new_v[:, :1560]
+                            if new_fg_mask is not None:
+                                bank["fg_mask_new"][:,:] = new_fg_mask
             
             # Update indices: do not roll back pointers during recomputation
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
@@ -1081,15 +1252,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 write_start_index_bank = write_end_index_bank - 1560
                 new_k = bank["k_new"].clone()
                 new_v = bank["v_new"].clone()
+                new_fg_mask = bank.get("fg_mask_new", None)
+                if new_fg_mask is not None:
+                    new_fg_mask = new_fg_mask.clone()
                 with torch.no_grad():
                     if write_end_index_bank <= bank["k"].shape[1]:
                         bank["k"][:, write_start_index_bank:write_end_index_bank] = new_k
                         bank["v"][:, write_start_index_bank:write_end_index_bank] = new_v
+                        if new_fg_mask is not None and "fg_mask" in bank:
+                            bank["fg_mask"][:, write_start_index_bank:write_end_index_bank] = new_fg_mask
                     else:
                         new_compressed_kv_cache = self.compress_kv_bank(
                             kv_cache=bank,
                             new_k=new_k,
                             new_v=new_v,
+                            new_fg_mask=new_fg_mask,
                             crossattn_cache=crossattn_cache_block,
                             tokens_per_block=1560,
                             memory_budget_in_blocks=self.bank_size,
@@ -1097,6 +1274,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         )
                         bank["k"][:,:] = new_compressed_kv_cache["k"]
                         bank["v"][:,:] = new_compressed_kv_cache["v"]
+                        if "fg_mask" in bank and "fg_mask" in new_compressed_kv_cache:
+                            bank["fg_mask"][:,:] = new_compressed_kv_cache["fg_mask"]
 
     def compress_kv_bank(
         self,
@@ -1104,6 +1283,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         new_k: torch.Tensor,
         new_v: torch.Tensor,
         crossattn_cache: Dict[str, torch.Tensor],
+        new_fg_mask: torch.Tensor = None,
         tokens_per_block: int = 1560,
         memory_budget_in_blocks: int = 3,
         num_prototypes_in_blocks: int = 1, # Represents the number of new blocks
@@ -1125,6 +1305,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         """
         # --- Step 0: Prepare Tensors and Information ---
         hist_k, hist_v = kv_cache['k'].clone(), kv_cache['v'].clone()
+        hist_fg_mask = kv_cache.get('fg_mask', None)
+        if hist_fg_mask is not None:
+            hist_fg_mask = hist_fg_mask.clone()
         text_q = crossattn_cache["k"].clone()
 
         B, L_hist, H, D = hist_k.shape
@@ -1166,30 +1349,42 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # Gather the most salient historical blocks
         hist_k_blocks = hist_k.view(B, num_hist_blocks, tokens_per_block, H, D)
         hist_v_blocks = hist_v.view(B, num_hist_blocks, tokens_per_block, H, D)
+        if hist_fg_mask is not None and new_fg_mask is not None:
+            hist_mask_blocks = hist_fg_mask.view(B, num_hist_blocks, tokens_per_block)
         
         expanded_indices = topk_indices.view(B, k_to_select, 1, 1, 1).expand(-1, -1, tokens_per_block, H, D)
         
         salient_k_blocks = torch.gather(hist_k_blocks, 1, expanded_indices)
         salient_v_blocks = torch.gather(hist_v_blocks, 1, expanded_indices)
+        if hist_fg_mask is not None and new_fg_mask is not None:
+            expanded_mask_indices = topk_indices.view(B, k_to_select, 1).expand(-1, -1, tokens_per_block)
+            salient_mask_blocks = torch.gather(hist_mask_blocks, 1, expanded_mask_indices)
 
         # --- Step 3: Construct the Final Compressed Cache ---
 
         # Reshape new blocks and concatenate with salient historical blocks
         new_k_blocks = new_k.view(B, num_new_blocks, tokens_per_block, H, D)
         new_v_blocks = new_v.view(B, num_new_blocks, tokens_per_block, H, D)
+        if hist_fg_mask is not None and new_fg_mask is not None:
+            new_mask_blocks = new_fg_mask.view(B, num_new_blocks, tokens_per_block)
 
         # Concatenate in block view, then reshape to final token sequence
         final_k_blocks = torch.cat([salient_k_blocks, new_k_blocks], dim=1)
         final_v_blocks = torch.cat([salient_v_blocks, new_v_blocks], dim=1)
+        if hist_fg_mask is not None and new_fg_mask is not None:
+            final_mask_blocks = torch.cat([salient_mask_blocks, new_mask_blocks], dim=1)
 
         final_num_tokens = (k_to_select + num_new_blocks) * tokens_per_block
         final_k = final_k_blocks.reshape(B, final_num_tokens, H, D)
         final_v = final_v_blocks.reshape(B, final_num_tokens, H, D)
-        
-        return {
+
+        result = {
             "k": final_k,
             "v": final_v,
         }
+        if hist_fg_mask is not None and new_fg_mask is not None:
+            result["fg_mask"] = final_mask_blocks.reshape(B, final_num_tokens)
+        return result
 
     def _forward_inference(
         self,
